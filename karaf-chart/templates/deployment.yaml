@@ -96,14 +96,19 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           # chmod +x makes the script executable
-          command: ["sh", "-c", "cp /scripts/cron-script.sh /mnt/scripts/cron-script.sh && chmod +x /mnt/scripts/cron-script.sh"]
+          command:
+          - sh
+          - -c
+          - |
+          cp /scripts/cron-script.sh /mnt/scripts/cron-script.sh && \
+    chmod +x /mnt/scripts/cron-script.sh
           securityContext:
             runAsNonRoot: true
             runAsUser: 1000
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
-              drop: [ALL]
+              drop: ALL
           volumeMounts:
             - name: scripts-readonly
               mountPath: /scripts
