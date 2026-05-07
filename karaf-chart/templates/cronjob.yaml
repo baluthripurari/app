@@ -1,0 +1,215 @@
+# ============================================================
+# cronjob.yaml
+# WHY Kubernetes CronJob over in-pod crond:
+#
+# 1. CLOUD-NATIVE: Kubernetes manages scheduling — no crond daemon
+#    needed inside the application container.
+# 2. ISOLATION: Each cron run is a FRESH pod. No state from previous
+#    run can affect the next run.
+# 3. OBSERVABILITY: Each job's logs are stored separately.
+#    `kubectl logs job/karaf-chart-cron-<timestamp>` shows exactly
+#    what happened in that specific run.
+# 4. RETRIES: K8s can automatically retry failed jobs.
+# 5. RESOURCE CONTROL: The cron pod can have its own resource limits,
+#    separate from the main Karaf pod.
+# 6. HISTORY: K8s keeps pod logs for the last N jobs (configurable).
+# ============================================================
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  # Naming convention: <release>-cron — clearly identifies this as
+  # the scheduled job component of the karaf release
+  name: {{ include "karaf-chart.fullname" . }}-cron
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "karaf-chart.labels" . | nindent 4 }}
+    # Extra label to distinguish the CronJob from the Deployment
+    app.kubernetes.io/component: cronjob
+
+spec:
+  # ── SCHEDULE ────────────────────────────────────────────────
+  # Cron format: minute hour day-of-month month day-of-week
+  # "*/1 * * * *" = every 1 minute, every hour, every day, etc.
+  # Equivalent shortcuts: @hourly, @daily, @weekly, @monthly
+  # WHY Helm value: operators can change frequency without editing YAML.
+  schedule: {{ .Values.cronJob.schedule | quote }}
+
+  # ── TIMEZONE (K8s 1.27+) ──────────────────────────────────
+  # WHY: Without this, the cron runs in UTC.
+  # Explicitly setting UTC removes any ambiguity and is best practice
+  # for cloud-native applications (always operate in UTC).
+  timeZone: "UTC"
+
+  # ── CONCURRENCY POLICY ────────────────────────────────────
+  # Forbid: If job N is still running when job N+1 should start,
+  # skip job N+1. Prevents overlap / double-processing.
+  # WHY Forbid: For a print job running every minute, if one run
+  # takes > 1 minute, we don't want 2 runs printing simultaneously.
+  concurrencyPolicy: {{ .Values.cronJob.concurrencyPolicy }}
+
+  # ── HISTORY LIMITS ────────────────────────────────────────
+  # Kubernetes keeps pod logs from completed jobs.
+  # successfulJobsHistoryLimit: keep last 3 successful pods for debugging
+  # failedJobsHistoryLimit: keep last 1 failed pod for debugging
+  # WHY limit: Each completed pod consumes etcd storage. Too many = bloat.
+  successfulJobsHistoryLimit: {{ .Values.cronJob.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.cronJob.failedJobsHistoryLimit }}
+
+  # ── STARTING DEADLINE SECONDS ─────────────────────────────
+  # WHY: If K8s controller was down and missed scheduled runs,
+  # it will only try to catch up jobs missed within this window (seconds).
+  # Prevents a flood of catch-up jobs after a controller restart.
+  startingDeadlineSeconds: 60
+
+  # ── JOB TEMPLATE ──────────────────────────────────────────
+  # The blueprint for the Kubernetes Job created each time cron fires.
+  jobTemplate:
+    spec:
+      # ── BACKOFF LIMIT ─────────────────────────────────────
+      # If the job pod fails, retry up to this many times.
+      # For a simple print script, 2 retries is reasonable.
+      backoffLimit: 2
+
+      # ── ACTIVE DEADLINE SECONDS ───────────────────────────
+      # If the job is still running after 90 seconds, K8s KILLS it.
+      # WHY: Prevents zombie jobs from running forever if the script hangs.
+      activeDeadlineSeconds: 90
+
+      # ── POD TEMPLATE ──────────────────────────────────────
+      template:
+        metadata:
+          labels:
+            {{- include "karaf-chart.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: cronjob
+
+        spec:
+          # ── SERVICE ACCOUNT ─────────────────────────────
+          # Use the same dedicated SA as the main app.
+          serviceAccountName: {{ include "karaf-chart.serviceAccountName" . }}
+          automountServiceAccountToken: false
+
+          # ── RESTART POLICY ──────────────────────────────
+          # CRITICAL: For Jobs/CronJobs, restartPolicy MUST be
+          # OnFailure or Never. (Never = K8s creates a new pod on failure
+          # instead of restarting the same pod — better for debugging)
+          # Never use "Always" for CronJobs — it would restart the pod
+          # endlessly even after successful completion.
+          restartPolicy: OnFailure
+
+          # ── POD SECURITY CONTEXT ────────────────────────
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+
+          # ── INIT CONTAINER ──────────────────────────────
+          # Make the script executable before the main container runs
+          initContainers:
+            - name: init-script
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command:
+                - sh
+                - -c
+                - cp /scripts-src/cron-script.sh /scripts/cron-script.sh && chmod +x /scripts/cron-script.sh
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 1000
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              volumeMounts:
+                - name: scripts-src
+                  mountPath: /scripts-src
+                - name: scripts
+                  mountPath: /scripts
+
+          # ── MAIN CONTAINER ──────────────────────────────
+          containers:
+            - name: cron-printer
+              # Same image as the main app — consistent toolset,
+              # same JRE, same OS (Rocky Linux 9)
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+              # ── CONTAINER SECURITY CONTEXT ──────────────
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 1000
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+
+              # ── COMMAND ─────────────────────────────────
+              # Run the shell script from the mounted ConfigMap.
+              # WHY not hardcode: Script lives in ConfigMap —
+              # update values.yaml → `helm upgrade` → new script
+              # WITHOUT rebuilding the Docker image.
+              command:
+                - /bin/bash
+                - /scripts/cron-script.sh
+
+              # ── ENV VARS ────────────────────────────────
+              # Inject pod metadata so the script can log context
+              env:
+                - name: POD_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
+                - name: POD_NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+                - name: NODE_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: spec.nodeName
+
+              # Load app config (LOG_LEVEL, APP_ENV etc.)
+              envFrom:
+                - configMapRef:
+                    name: {{ include "karaf-chart.fullname" . }}-config
+
+              # ── RESOURCES ───────────────────────────────
+              # Cron job only runs a script — needs far fewer resources
+              # than the main Karaf JVM. Separate limits = cost savings.
+              resources:
+                requests:
+                  memory: "64Mi"
+                  cpu: "50m"
+                limits:
+                  memory: "128Mi"
+                  cpu: "100m"
+
+              # ── VOLUME MOUNTS ───────────────────────────
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+
+          # ── VOLUMES ─────────────────────────────────────
+          volumes:
+            # ConfigMap volume: exposes ConfigMap keys as files
+            # The cron-script.sh key becomes a file at /scripts-src/cron-script.sh
+            - name: scripts-src
+              configMap:
+                name: {{ include "karaf-chart.fullname" . }}-config
+                items:
+                  - key: cron-script.sh
+                    path: cron-script.sh
+                defaultMode: 0644
+
+            # Writable copy of scripts (init container writes here)
+            - name: scripts
+              emptyDir: {}
+
+            # Writable /tmp (needed for readOnlyRootFilesystem)
+            - name: tmp
+              emptyDir: {}

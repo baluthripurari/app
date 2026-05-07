@@ -1,0 +1,258 @@
+# ============================================================
+# deployment.yaml
+# A Deployment manages a ReplicaSet, which manages Pods.
+# WHY Deployment over bare Pod: Deployments provide rolling
+# updates, rollbacks, scaling, and self-healing (restarts
+# crashed pods). Never run bare Pods in production.
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  # Name is unique per namespace. The fullname helper ensures
+  # release-scoped names, allowing multiple releases in same namespace.
+  name: {{ include "karaf-chart.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "karaf-chart.labels" . | nindent 4 }}
+
+spec:
+  # ── REPLICAS ──────────────────────────────────────────────
+  # Number of pod instances to run. With autoscaling enabled,
+  # HPA will OVERRIDE this after initial deployment.
+  # WHY 2+: Single replica = SPOF (single point of failure).
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+
+  # ── SELECTOR ──────────────────────────────────────────────
+  # matchLabels tells the Deployment WHICH pods it manages.
+  # The Deployment will only manage pods with these exact labels.
+  # CRITICAL: This CANNOT be changed after the Deployment is created
+  # without deleting and recreating it.
+  selector:
+    matchLabels:
+      {{- include "karaf-chart.selectorLabels" . | nindent 6 }}
+
+  # ── UPDATE STRATEGY ───────────────────────────────────────
+  # RollingUpdate: gradually replaces old pods with new ones.
+  # WHY: Ensures zero downtime. At no point is the app fully down.
+  # Alternative: Recreate (kills all pods then starts new) = downtime.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # maxUnavailable: Max pods that can be DOWN during update.
+      # 0 = always keep full capacity (zero-downtime upgrade)
+      maxUnavailable: 0
+      # maxSurge: Max EXTRA pods during update.
+      # 1 = spin up 1 new pod before killing an old one
+      maxSurge: 1
+
+  # ── POD TEMPLATE ──────────────────────────────────────────
+  # The "blueprint" for each Pod created by this Deployment.
+  template:
+    metadata:
+      labels:
+        {{- include "karaf-chart.selectorLabels" . | nindent 8 }}
+      annotations:
+        # checksum/config: A hash of the ConfigMap contents.
+        # WHY: If values.yaml config changes, this annotation changes,
+        # which triggers a rolling restart of pods — so pods pick up
+        # the new config automatically. Without this, pods keep old config
+        # until manually restarted.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+
+    spec:
+      # ── SERVICE ACCOUNT ─────────────────────────────────
+      # Use the dedicated SA we created (not the default SA)
+      serviceAccountName: {{ include "karaf-chart.serviceAccountName" . }}
+
+      # automountServiceAccountToken: false at pod level as well.
+      # Belt-and-suspenders: both SA and pod spec disable token mount.
+      automountServiceAccountToken: false
+
+      # ── POD SECURITY CONTEXT ────────────────────────────
+      # Applies to ALL containers in this pod.
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+
+      # ── TERMINATION GRACE PERIOD ────────────────────────
+      # WHY: When a pod is deleted, K8s sends SIGTERM and waits
+      # this many seconds before force-killing with SIGKILL.
+      # Karaf needs time to finish processing in-flight requests
+      # and shut down OSGi bundles cleanly. 60s is a safe value.
+      terminationGracePeriodSeconds: 60
+
+      # ── INIT CONTAINERS ─────────────────────────────────
+      # WHY: Run BEFORE main containers. Used for:
+      # - Waiting for dependencies (DB, config service)
+      # - Setting up filesystem permissions
+      # Here we make the cron script executable.
+      initContainers:
+        - name: init-permissions
+          # Use the same image as main app (same base OS/tools)
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # chmod +x makes the script executable
+          command: ["sh", "-c", "cp /scripts/cron-script.sh /mnt/scripts/cron-script.sh && chmod +x /mnt/scripts/cron-script.sh"]
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: scripts-readonly
+              mountPath: /scripts
+            - name: scripts-writable
+              mountPath: /mnt/scripts
+
+      # ── MAIN CONTAINERS ─────────────────────────────────
+      containers:
+        - name: karaf
+          # WHY "{{ }}" syntax: Pulls values from values.yaml at runtime.
+          # Makes image tag overridable without editing this template.
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+
+          # imagePullPolicy: see values.yaml for explanation
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+          # ── CONTAINER SECURITY CONTEXT ──────────────────
+          # Container-level — overrides/extends pod-level securityContext
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+
+          # ── PORTS ───────────────────────────────────────
+          # INFORMATIONAL only — does not open firewall rules.
+          # Required for Services to reference by name.
+          ports:
+            - name: http        # Named port — Services use this name
+              containerPort: 8181
+              protocol: TCP
+            - name: rmi-registry
+              containerPort: 1099
+              protocol: TCP
+            - name: rmi-server
+              containerPort: 44444
+              protocol: TCP
+
+          # ── ENVIRONMENT VARIABLES ───────────────────────
+          # Inject pod metadata as env vars (Downward API).
+          # WHY: Allows the app/scripts to know which pod/node they're on.
+          # Useful for logging, tracing, and debugging.
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name     # Actual pod name at runtime
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+
+          # ── CONFIG FROM CONFIGMAP ───────────────────────
+          # envFrom loads ALL keys from the ConfigMap as env vars.
+          # WHY: Cleaner than listing each env var individually.
+          # Changes to ConfigMap + pod restart → new config applied.
+          envFrom:
+            - configMapRef:
+                name: {{ include "karaf-chart.fullname" . }}-config
+
+          # ── RESOURCE LIMITS ─────────────────────────────
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+          # ── STARTUP PROBE ───────────────────────────────
+          # Checked FIRST. Gives Karaf time to boot before liveness kicks in.
+          {{- with .Values.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+          # ── LIVENESS PROBE ──────────────────────────────
+          # If this fails → K8s RESTARTS the container
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+          # ── READINESS PROBE ─────────────────────────────
+          # If this fails → pod is removed from Service endpoints (no traffic)
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+          # ── VOLUME MOUNTS ───────────────────────────────
+          # WHY: readOnlyRootFilesystem:true means nothing can be written
+          # to the container's root fs. But Karaf needs to write logs, tmp files.
+          # Solution: Mount writable emptyDir volumes for directories that need writes.
+          # emptyDir: lives as long as the pod, starts empty each time — ephemeral.
+          volumeMounts:
+            # Karaf writes logs to data/log/
+            - name: karaf-data
+              mountPath: /opt/karaf/data
+            # Karaf writes temp files here
+            - name: karaf-tmp
+              mountPath: /tmp
+            # Script volume (executable copy from init container)
+            - name: scripts-writable
+              mountPath: /scripts
+              readOnly: true
+
+      # ── VOLUMES ─────────────────────────────────────────
+      # Defines the volumes that containers can mount.
+      volumes:
+        # emptyDir: Created fresh when pod starts. Deleted when pod dies.
+        # Shared between containers in the same pod.
+        # Good for: Karaf data, tmp, logs (non-persistent)
+        - name: karaf-data
+          emptyDir: {}
+        - name: karaf-tmp
+          emptyDir: {}
+
+        # Scripts from ConfigMap — read-only mount
+        # The ConfigMap key 'cron-script.sh' appears as a FILE at mountPath
+        - name: scripts-readonly
+          configMap:
+            name: {{ include "karaf-chart.fullname" . }}-config
+            items:
+              - key: cron-script.sh
+                path: cron-script.sh
+            # defaultMode: Octal 0755 = rwxr-xr-x (owner can execute)
+            defaultMode: 0755
+
+        # Writable copy of scripts (populated by init container)
+        - name: scripts-writable
+          emptyDir: {}
+
+      # ── NODE SELECTOR ───────────────────────────────────
+      # If values.yaml has nodeSelector, apply it here
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      # ── AFFINITY ────────────────────────────────────────
+      # Spread pods across AZs for high availability (see values.yaml)
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      # ── TOLERATIONS ─────────────────────────────────────
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

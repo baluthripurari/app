@@ -1,0 +1,81 @@
+# ============================================================
+# networkpolicy.yaml
+# WHY: By default, ALL pods in a cluster can talk to ALL other pods.
+# This is the "flat network" model — dangerous in production.
+# NetworkPolicy is a pod-level firewall. It implements:
+# "Default deny all, explicitly allow what's needed."
+#
+# PREREQUISITE: Your EKS cluster must use a CNI plugin that supports
+# NetworkPolicy (e.g., AWS VPC CNI with Network Policy enabled,
+# Calico, or Cilium). Vanilla EKS VPC CNI needs the network policy
+# add-on enabled in the EKS console or via Terraform.
+# ============================================================
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "karaf-chart.fullname" . }}-netpol
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "karaf-chart.labels" . | nindent 4 }}
+spec:
+  # podSelector: This policy applies to pods matching these labels.
+  # Empty podSelector ({}) would apply to ALL pods in namespace — avoid that.
+  podSelector:
+    matchLabels:
+      {{- include "karaf-chart.selectorLabels" . | nindent 6 }}
+
+  # policyTypes: This policy controls both incoming and outgoing traffic.
+  policyTypes:
+    - Ingress   # Control which traffic CAN come IN to the pod
+    - Egress    # Control which traffic CAN go OUT from the pod
+
+  # ── INGRESS RULES ──────────────────────────────────────────
+  # Allow traffic FROM these sources TO our Karaf pods.
+  ingress:
+    # Rule 1: Allow from pods within the same namespace.
+    # WHY: Microservices in same namespace can call each other.
+    - from:
+        - podSelector: {}   # Any pod in the same namespace
+      ports:
+        - protocol: TCP
+          port: 8181   # Karaf HTTP
+
+    # Rule 2: Allow from the monitoring namespace (Prometheus).
+    # WHY: Prometheus scrapes metrics from pods across namespaces.
+    # The namespaceSelector matches the monitoring namespace by label.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8181   # Prometheus metrics endpoint
+
+  # ── EGRESS RULES ───────────────────────────────────────────
+  # Allow traffic FROM our Karaf pods TO these destinations.
+  egress:
+    # Rule 1: Allow DNS resolution.
+    # WHY: Without this, pods CANNOT resolve any hostname.
+    # kube-dns runs on port 53 UDP and TCP.
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # Rule 2: Allow Karaf to call the K8s API server.
+    # WHY: If Karaf bundles use K8s client libraries, they need API access.
+    # Port 443 = HTTPS to the API server. Remove if Karaf doesn't call K8s API.
+    - ports:
+        - protocol: TCP
+          port: 443
+
+    # Rule 3: Allow pod-to-pod communication within namespace.
+    # WHY: Karaf may need to call other microservices in the same namespace.
+    - to:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8181
+{{- end }}

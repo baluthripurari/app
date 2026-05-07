@@ -1,0 +1,47 @@
+# ============================================================
+# Chart.yaml — The identity card of your Helm chart.
+# Every Helm chart MUST have this file.
+# ============================================================
+
+# apiVersion: v2
+# WHY: Helm 3 uses apiVersion v2. Helm 2 used v1.
+# Always use v2 for new charts — it supports dependencies and
+# typed charts (application vs library).
+apiVersion: v2
+
+# name: must match the directory name of the chart.
+# Used in release names: `helm install <release> ./karaf-chart`
+name: karaf-chart
+
+# description: shown in `helm show chart` and artifact hubs.
+# Helps teams understand what this chart deploys.
+description: "Apache Karaf 4.2.16 on Rocky Linux 9 with JRE-11, deployed on EKS"
+
+# type: "application" = deployable chart (has templates).
+# The other option is "library" = helper chart with no templates,
+# only named templates (_helpers.tpl) used by other charts.
+type: application
+
+# version: The CHART version (SemVer). Bump this when you change
+# the chart templates or values — NOT the application version.
+# Used by Helm to track chart upgrades.
+version: 0.1.0
+
+# appVersion: The APPLICATION version being deployed.
+# Informational only — not used by Helm logic directly.
+# Shown in `helm list` and helps operators know what's running.
+appVersion: "4.2.16"
+
+# keywords: Used by Artifact Hub / Helm search for discoverability.
+keywords:
+  - karaf
+  - java
+  - osgi
+  - rocky-linux
+  - middleware
+
+# maintainers: Documents who owns this chart.
+# Useful for on-call/escalation in production environments.
+maintainers:
+  - name: DevOps Team
+    email: devops@company.com

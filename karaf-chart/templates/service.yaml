@@ -1,0 +1,34 @@
+# ============================================================
+# service.yaml
+# WHY: A Service gives pods a STABLE network identity.
+# Pods are ephemeral — they die, restart with new IPs.
+# A Service provides a consistent DNS name + IP (ClusterIP)
+# that automatically routes to healthy pods.
+# ============================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "karaf-chart.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "karaf-chart.labels" . | nindent 4 }}
+spec:
+  # ClusterIP: Internal only — accessible within the cluster by name.
+  # The DNS name will be: <service-name>.<namespace>.svc.cluster.local
+  # For EKS external access: change to LoadBalancer (creates AWS NLB/ALB)
+  type: {{ .Values.service.type }}
+
+  # selector: Traffic goes to pods matching these labels.
+  # K8s continuously updates the endpoint list as pods come/go.
+  selector:
+    {{- include "karaf-chart.selectorLabels" . | nindent 4 }}
+
+  ports:
+    - name: http
+      # port: what clients connect to (the Service's port)
+      port: {{ .Values.service.port }}
+      # targetPort: the CONTAINER port that receives traffic
+      # Using named port ("http") is more resilient than port numbers —
+      # if containerPort changes, only Deployment needs updating.
+      targetPort: http
+      protocol: TCP

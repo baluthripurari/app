@@ -1,0 +1,304 @@
+# ============================================================
+# values.yaml — The single source of truth for all configurable
+# parameters in your chart. Operators override these via:
+#   helm install -f custom-values.yaml
+#   helm install --set key=value
+# BEST PRACTICE: Never hardcode values inside templates.
+# ============================================================
+
+# ─────────────────────────────────────────────────────────────
+# IMAGE CONFIGURATION
+# ─────────────────────────────────────────────────────────────
+image:
+  # repository: The container registry + image name.
+  # In EKS, this is typically your ECR URI.
+  # WHY ECR: It's in the same AWS account, IAM-authenticated,
+  # no DockerHub rate limits, and private by default.
+  repository: <your-aws-account-id>.dkr.ecr.<region>.amazonaws.com/karaf-app
+
+  # tag: The image tag. "latest" is NEVER used in production
+  # because it's unpredictable — you can't roll back to "latest".
+  # Use a specific version or commit SHA for reproducibility.
+  tag: "4.2.16"
+
+  # pullPolicy:
+  # IfNotPresent → use cached image if same tag exists (saves bandwidth, faster startup)
+  # Always       → always pull (use when tag is mutable e.g. "latest")
+  # Never        → only use local image (air-gapped environments)
+  pullPolicy: IfNotPresent
+
+# ─────────────────────────────────────────────────────────────
+# REPLICA COUNT
+# WHY: Set to 2 minimum for high availability.
+# If one pod crashes or a node goes down, the second handles traffic.
+# Combined with PodDisruptionBudget this ensures zero downtime upgrades.
+# ─────────────────────────────────────────────────────────────
+replicaCount: 2
+
+# ─────────────────────────────────────────────────────────────
+# RESOURCE REQUESTS AND LIMITS  ← CRITICAL BEST PRACTICE
+# WHY requests: Kubernetes uses these to SCHEDULE the pod on a
+# node that has enough capacity. Without requests, pods can be
+# scheduled on overloaded nodes.
+# WHY limits: Without limits, one rogue pod can starve all other
+# pods on the node (noisy neighbor problem). Limits = guardrails.
+# RULE: limits >= requests. Set requests = typical usage, 
+# limits = spike ceiling.
+# ─────────────────────────────────────────────────────────────
+resources:
+  requests:
+    # Karaf with JRE needs at least 512Mi to start cleanly
+    memory: "512Mi"
+    # 250m = 0.25 CPU core (m = millicores, 1000m = 1 vCPU)
+    cpu: "250m"
+  limits:
+    # Hard ceiling on memory — if exceeded, pod is OOMKilled and restarted
+    memory: "1Gi"
+    # Hard ceiling on CPU — if exceeded, pod is throttled (not killed)
+    cpu: "500m"
+
+# ─────────────────────────────────────────────────────────────
+# SECURITY CONTEXT — Pod level
+# WHY: Applied to ALL containers in the pod. Defines the
+# privilege level of the entire pod.
+# ─────────────────────────────────────────────────────────────
+podSecurityContext:
+  # runAsNonRoot: Kubernetes will REFUSE to start the pod if the
+  # container image runs as UID 0 (root). Defence-in-depth.
+  runAsNonRoot: true
+
+  # runAsUser: The UID the container process runs as.
+  # Must match the UID of the 'karaf' user created in Dockerfile.
+  runAsUser: 1000
+
+  # runAsGroup: The GID of the container process.
+  runAsGroup: 1000
+
+  # fsGroup: All files created in mounted volumes will be owned
+  # by this GID. Allows the karaf process to read/write volumes.
+  fsGroup: 1000
+
+  # seccompProfile: Restricts which Linux kernel syscalls the
+  # container can make. RuntimeDefault = Docker/container runtime's
+  # default seccomp profile — blocks ~300+ dangerous syscalls.
+  seccompProfile:
+    type: RuntimeDefault
+
+# ─────────────────────────────────────────────────────────────
+# SECURITY CONTEXT — Container level (overrides pod-level)
+# ─────────────────────────────────────────────────────────────
+containerSecurityContext:
+  # allowPrivilegeEscalation: Prevents the process from gaining
+  # MORE privileges than it started with (e.g., via setuid binaries).
+  allowPrivilegeEscalation: false
+
+  # readOnlyRootFilesystem: The container's root filesystem is
+  # mounted read-only. An attacker cannot write malware to disk.
+  # NOTE: Karaf needs writable dirs — we mount those as emptyDir volumes.
+  readOnlyRootFilesystem: true
+
+  # capabilities: Linux capabilities are fine-grained root permissions.
+  # drop ALL = remove every capability (even harmless ones).
+  # Add back ONLY what the app truly needs.
+  capabilities:
+    drop:
+      - ALL
+    # NET_BIND_SERVICE: allows binding to ports below 1024.
+    # Only add if Karaf needs to bind to port 80/443. Otherwise remove.
+    # add:
+    #   - NET_BIND_SERVICE
+
+# ─────────────────────────────────────────────────────────────
+# SERVICE ACCOUNT
+# WHY: Each pod should have its OWN dedicated service account
+# with ONLY the permissions it needs (principle of least privilege).
+# The default service account often has broad permissions — risky.
+# ─────────────────────────────────────────────────────────────
+serviceAccount:
+  create: true
+  # automountServiceAccountToken: false = the pod will NOT
+  # automatically get the K8s API token mounted.
+  # WHY: If Karaf doesn't call the K8s API, it doesn't need the
+  # token. Reduces attack surface — stolen token = API access.
+  automountServiceAccountToken: false
+  annotations: {}
+    # For IRSA (IAM Roles for Service Accounts) on EKS:
+    # eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<role-name>
+
+# ─────────────────────────────────────────────────────────────
+# SERVICE
+# Exposes the pod inside the cluster (or externally).
+# ─────────────────────────────────────────────────────────────
+service:
+  # ClusterIP: Internal only — no external access.
+  # Use LoadBalancer or NodePort for external access.
+  # In EKS, LoadBalancer creates an AWS ALB/NLB automatically.
+  type: ClusterIP
+  port: 8181
+
+# ─────────────────────────────────────────────────────────────
+# LIVENESS PROBE
+# WHY: Kubernetes uses this to detect if the container is DEAD
+# (stuck, deadlocked). If it fails, K8s RESTARTS the container.
+# Think of it as: "Is the app alive at all?"
+# ─────────────────────────────────────────────────────────────
+livenessProbe:
+  httpGet:
+    path: /system/console
+    port: 8181
+  # initialDelaySeconds: Wait this long before first probe.
+  # WHY: Karaf takes ~60s to start. Without this, K8s would
+  # restart the pod before it even finishes booting — infinite loop.
+  initialDelaySeconds: 60
+  # periodSeconds: How often to check
+  periodSeconds: 30
+  # failureThreshold: Fail 3 times before restart
+  failureThreshold: 3
+
+# ─────────────────────────────────────────────────────────────
+# READINESS PROBE
+# WHY: Kubernetes uses this to detect if the container is READY
+# to RECEIVE TRAFFIC. If it fails, the pod is removed from the
+# Service's endpoint list (no traffic sent), but NOT restarted.
+# Think of it as: "Is the app ready to serve requests?"
+# ─────────────────────────────────────────────────────────────
+readinessProbe:
+  httpGet:
+    path: /system/console
+    port: 8181
+  initialDelaySeconds: 45
+  periodSeconds: 10
+  failureThreshold: 3
+
+# ─────────────────────────────────────────────────────────────
+# STARTUP PROBE  ← MODERN BEST PRACTICE (K8s 1.18+)
+# WHY: Gives slow-starting containers extra time to boot without
+# triggering liveness probe restarts. Once startup probe succeeds,
+# liveness and readiness probes take over.
+# ─────────────────────────────────────────────────────────────
+startupProbe:
+  httpGet:
+    path: /system/console
+    port: 8181
+  # 30 failures × 10s = 300s (5 min) to start before giving up
+  failureThreshold: 30
+  periodSeconds: 10
+
+# ─────────────────────────────────────────────────────────────
+# POD DISRUPTION BUDGET (PDB)
+# WHY: During rolling upgrades or node drains (kubectl drain),
+# Kubernetes might try to evict ALL pods simultaneously.
+# PDB says: "Always keep at least 1 pod running."
+# Critical for zero-downtime deployments.
+# ─────────────────────────────────────────────────────────────
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# ─────────────────────────────────────────────────────────────
+# NETWORK POLICY
+# WHY: By default ALL pods can talk to ALL other pods in a cluster.
+# NetworkPolicy is a firewall at the pod level.
+# Principle: Default-deny everything, allow only what's needed.
+# ─────────────────────────────────────────────────────────────
+networkPolicy:
+  enabled: true
+
+# ─────────────────────────────────────────────────────────────
+# HORIZONTAL POD AUTOSCALER (HPA)
+# WHY: Automatically scales pods up/down based on CPU/memory.
+# Saves money during low traffic, handles spikes automatically.
+# ─────────────────────────────────────────────────────────────
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  # Scale up when average CPU across all pods > 70%
+  targetCPUUtilizationPercentage: 70
+  # Scale up when average memory across all pods > 80%
+  targetMemoryUtilizationPercentage: 80
+
+# ─────────────────────────────────────────────────────────────
+# NODE SELECTOR
+# WHY: Pin pods to specific nodes (e.g., nodes with SSD, or
+# specific instance types). In EKS, you label node groups.
+# ─────────────────────────────────────────────────────────────
+nodeSelector: {}
+  # Example: kubernetes.io/arch: amd64
+
+# ─────────────────────────────────────────────────────────────
+# TOLERATIONS
+# WHY: If nodes have taints (intentional "stains" that repel pods),
+# tolerations allow specific pods to be scheduled on those nodes.
+# Use case: dedicated nodes for Java workloads with memory taints.
+# ─────────────────────────────────────────────────────────────
+tolerations: []
+
+# ─────────────────────────────────────────────────────────────
+# AFFINITY
+# WHY: Controls WHERE pods are placed relative to nodes/other pods.
+# podAntiAffinity: spread pods across DIFFERENT nodes/AZs.
+# This ensures HA — if one AZ goes down, the other pod survives.
+# ─────────────────────────────────────────────────────────────
+affinity:
+  podAntiAffinity:
+    # preferredDuringScheduling = soft rule (best effort, not mandatory)
+    # requiredDuringScheduling = hard rule (must comply or pod stays Pending)
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - karaf-chart
+          # Spread across different availability zones (AZs) in EKS
+          topologyKey: topology.kubernetes.io/zone
+
+# ─────────────────────────────────────────────────────────────
+# CRON JOB CONFIGURATION
+# WHY: Kubernetes CronJob is the cloud-native way to run
+# scheduled tasks. Better than crond inside the pod because:
+# - Each run is a fresh pod (no state leakage)
+# - Failures are logged separately
+# - K8s manages the scheduling, retries, and history
+# ─────────────────────────────────────────────────────────────
+cronJob:
+  # Cron expression: "*/1 * * * *" = every 1 minute
+  # Format: minute hour day-of-month month day-of-week
+  schedule: "*/1 * * * *"
+
+  # successfulJobsHistoryLimit: Keep last 3 successful job pods
+  # for debugging. After 3, old ones are auto-deleted.
+  successfulJobsHistoryLimit: 3
+
+  # failedJobsHistoryLimit: Keep last 1 failed job for debugging.
+  failedJobsHistoryLimit: 1
+
+  # concurrencyPolicy:
+  # Forbid  = if previous job still running, skip new run
+  # Allow   = run multiple concurrently (risky for print tasks)
+  # Replace = kill previous, start new
+  concurrencyPolicy: Forbid
+
+# ─────────────────────────────────────────────────────────────
+# CONFIGMAP DATA
+# WHY: Externalise configuration from the image. ConfigMaps let
+# you change config without rebuilding the Docker image.
+# ─────────────────────────────────────────────────────────────
+config:
+  LOG_LEVEL: "INFO"
+  KARAF_OPTS: "-Xms256m -Xmx512m"
+  APP_ENV: "production"
+
+# ─────────────────────────────────────────────────────────────
+# POD ANNOTATIONS
+# WHY: Prometheus scraping, Datadog, Vault injection etc. all
+# use annotations to know which pods to monitor/inject into.
+# ─────────────────────────────────────────────────────────────
+podAnnotations:
+  # Prometheus will scrape metrics from port 8181 at /metrics
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8181"
+  prometheus.io/path: "/metrics"

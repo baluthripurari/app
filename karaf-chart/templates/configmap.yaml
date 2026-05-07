@@ -1,0 +1,92 @@
+# ============================================================
+# configmap.yaml
+# WHY: ConfigMaps decouple configuration from the Docker image.
+# Without ConfigMaps, config changes require a full image rebuild.
+# With ConfigMaps, you just `helm upgrade` with new values.
+#
+# ConfigMaps store non-sensitive config. For passwords, tokens,
+# certificates → use Secrets (or better: AWS Secrets Manager +
+# External Secrets Operator on EKS).
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  # Name referenced in deployment.yaml via envFrom.configMapRef.name
+  name: {{ include "karaf-chart.fullname" . }}-config
+
+  namespace: {{ .Release.Namespace }}
+
+  labels:
+    {{- include "karaf-chart.labels" . | nindent 4 }}
+
+data:
+  # ── Application configuration ──────────────────────────────
+  # Values come from values.yaml → config section.
+  # This way, operators can change config without editing this file:
+  #   helm upgrade myrelease ./karaf-chart --set config.LOG_LEVEL=DEBUG
+
+  # LOG_LEVEL: controls verbosity of Karaf/Java logging
+  LOG_LEVEL: {{ .Values.config.LOG_LEVEL | quote }}
+
+  # KARAF_OPTS: JVM tuning flags passed to Karaf startup script
+  # -Xms = initial heap size, -Xmx = max heap size
+  KARAF_OPTS: {{ .Values.config.KARAF_OPTS | quote }}
+
+  # APP_ENV: tells the app which environment it's running in
+  # (production vs staging vs dev) — used for feature flags, endpoints
+  APP_ENV: {{ .Values.config.APP_ENV | quote }}
+
+  # ── Cron script ────────────────────────────────────────────
+  # WHY store the script in a ConfigMap: The script can be changed
+  # WITHOUT rebuilding the Docker image. Just `helm upgrade`.
+  # The CronJob mounts this ConfigMap as a file and executes it.
+  cron-script.sh: |
+    #!/bin/bash
+    # ──────────────────────────────────────────────────────────
+    # cron-script.sh
+    # Runs every minute inside the CronJob pod.
+    # Prints current timestamp and system data.
+    # ──────────────────────────────────────────────────────────
+
+    # set -e → exit immediately on any error (no silent failures)
+    # set -u → treat unset variables as errors
+    # set -o pipefail → pipeline fails if any stage fails
+    set -euo pipefail
+
+    echo "============================================"
+    echo "  Karaf Cron Job — $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo "============================================"
+
+    # Print pod identity (useful for debugging multi-replica setups)
+    echo "Pod Name    : ${POD_NAME:-unknown}"
+    echo "Namespace   : ${POD_NAMESPACE:-unknown}"
+    echo "Node        : ${NODE_NAME:-unknown}"
+
+    echo ""
+    echo "── System Data ──────────────────────────────"
+
+    # Disk usage
+    echo "Disk Usage:"
+    df -h / | tail -1
+
+    # Memory
+    echo "Memory:"
+    free -h | grep Mem
+
+    # Uptime
+    echo "Uptime      : $(uptime -p)"
+
+    # Java version (confirms JRE is available)
+    echo "Java        : $(java -version 2>&1 | head -1)"
+
+    echo "── Karaf Status ─────────────────────────────"
+    # Try to check if Karaf process is running
+    if pgrep -x "java" > /dev/null 2>&1; then
+      echo "Karaf JVM   : RUNNING"
+    else
+      echo "Karaf JVM   : NOT DETECTED (expected in standalone cron pod)"
+    fi
+
+    echo "============================================"
+    echo "  Cron job completed successfully"
+    echo "============================================"

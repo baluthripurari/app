@@ -1,0 +1,117 @@
+# ============================================================
+# poddisruptionbudget.yaml
+# WHY: A PodDisruptionBudget (PDB) protects your app during
+# VOLUNTARY disruptions (not crashes). Examples of voluntary:
+# - kubectl drain (node maintenance, EKS node group updates)
+# - Cluster autoscaler scaling down nodes
+# - Helm rolling upgrades
+#
+# Without PDB: K8s might evict ALL pods simultaneously during
+# a node drain → downtime.
+# With PDB (minAvailable: 1): K8s guarantees at least 1 pod
+# stays running during voluntary disruptions.
+#
+# NOT for: involuntary disruptions (node crashes, OOM kills).
+# ============================================================
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "karaf-chart.fullname" . }}-pdb
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "karaf-chart.labels" . | nindent 4 }}
+spec:
+  # minAvailable: At LEAST this many pods must be running at all times.
+  # Can also use maxUnavailable instead (pick one, not both).
+  # With replicaCount: 2 and minAvailable: 1 → K8s can evict 1 at a time.
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+
+  # selector: Identifies which pods this PDB protects.
+  selector:
+    matchLabels:
+      {{- include "karaf-chart.selectorLabels" . | nindent 6 }}
+{{- end }}
+
+---
+# ============================================================
+# hpa.yaml (HorizontalPodAutoscaler)
+# WHY: Automatically adjusts the number of pod replicas based on
+# observed metrics (CPU, memory, custom metrics).
+#
+# HOW IT WORKS:
+# 1. HPA queries metrics-server every 15s (default)
+# 2. If avg CPU > targetCPUUtilizationPercentage → scale UP
+# 3. If avg CPU < threshold for 5 min → scale DOWN
+#
+# PREREQUISITE: metrics-server must be installed in the cluster.
+# In EKS: `kubectl apply -f https://...metrics-server.yaml`
+# Or install via Helm: `helm install metrics-server metrics-server/metrics-server`
+# ============================================================
+{{- if .Values.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "karaf-chart.fullname" . }}-hpa
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "karaf-chart.labels" . | nindent 4 }}
+spec:
+  # scaleTargetRef: Which resource to scale (our Deployment)
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "karaf-chart.fullname" . }}
+
+  # minReplicas: Never scale below this. Ensures HA.
+  # Even during zero traffic, keep 2 replicas for redundancy.
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+
+  # maxReplicas: Never scale above this. Cost guard-rail.
+  # Prevents runaway scaling due to a DDoS or metric bug.
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+
+  metrics:
+    # Metric 1: CPU utilization
+    # Type: Resource = built-in K8s resource metrics
+    # When avg CPU across all pods > 70%, add more pods
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          # Utilization = % of the resource REQUEST (not limit)
+          # WHY requests: limits can be higher — using requests
+          # as baseline gives more predictable scaling behavior
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+
+    # Metric 2: Memory utilization
+    # Karaf/JVM can be memory-heavy — scale on memory too
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetMemoryUtilizationPercentage }}
+
+  # behavior: Fine-tune scale up/down speed (K8s 1.18+)
+  behavior:
+    scaleUp:
+      # stabilizationWindowSeconds: Wait 30s of sustained high load
+      # before scaling up. Prevents thrashing on brief traffic spikes.
+      stabilizationWindowSeconds: 30
+      policies:
+        # Scale up max 2 pods per 60 seconds
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      # Wait 5 minutes of sustained LOW load before scaling down.
+      # WHY: Scaling down too fast = traffic spike → pod is gone → latency spike
+      stabilizationWindowSeconds: 300
+      policies:
+        # Scale down max 1 pod per 120 seconds (conservative)
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+{{- end }}
